@@ -160,6 +160,16 @@ nvme_cmd_map_qiov(void *s, void *cmd, void *req, void *qiov, int entries) "s %p 
 nvme_cmd_map_qiov_pages(void *s, int i, uint64_t page) "s %p page[%d] 0x%"PRIx64
 nvme_cmd_map_qiov_iov(void *s, int i, void *page, int pages) "s %p iov[%d] %p pages %d"
 
+# nvme-tcp.c
+# prefix nvmf_tcp_ to avoid collisions as nvme.c does not use prefix nvme_pci_
+nvmf_tcp_error(uint64_t result, uint16_t sq_head, uint16_t sqid, uint16_t cid, uint16_t status) "cmd_specific %d sq_head %d sqid %d cid %d status 0x%x"
+nvmf_tcp_transport_connect(unsigned h_align, unsigned c_align, unsigned maxdata) "hostalign %u controlleralign %u maxdata %u"
+nvmf_tcp_submit_command(unsigned qid, unsigned opcode, unsigned cid, unsigned data_len, unsigned pad) "qid %u opcode %#02x cid %u data_len %u pad %uB"
+nvmf_tcp_recv_data(unsigned len) "len %u"
+nvmf_tcp_queue_created(unsigned qid) "id %d"
+nvmf_tcp_version(uint32_t mjr, uint32_t mnr, uint32_t ter) "Specification supported: %u.%u.%u"
+nvmf_tcp_setup_complete(unsigned page, unsigned block) "pagesize %u blocksize %u"
+
 # iscsi.c
 iscsi_xcopy(void *src_lun, uint64_t src_off, void *dst_lun, uint64_t dst_off, uint64_t bytes, int ret) "src_lun %p offset %"PRIu64" dst_lun %p offset %"PRIu64" bytes %"PRIu64" ret %d"
 

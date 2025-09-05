@@ -96,6 +96,7 @@ endif
 block_ss.add(when: libiscsi, if_true: files('iscsi-opts.c'))
 if host_os == 'linux'
   block_ss.add(files('nvme.c'))
+  block_ss.add(files('nvme-tcp.c'))
 endif
 if get_option('replication').allowed()
   block_ss.add(files('replication.c'))

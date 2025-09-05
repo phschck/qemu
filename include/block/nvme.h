@@ -544,17 +544,19 @@ enum NvmePmrmsclMask {
     (pmrmscl |= (uint32_t)(val & PMRMSCL_CBA_MASK) << PMRMSCL_CBA_SHIFT)
 
 enum NvmeSglDescriptorType {
-    NVME_SGL_DESCR_TYPE_DATA_BLOCK          = 0x0,
-    NVME_SGL_DESCR_TYPE_BIT_BUCKET          = 0x1,
-    NVME_SGL_DESCR_TYPE_SEGMENT             = 0x2,
-    NVME_SGL_DESCR_TYPE_LAST_SEGMENT        = 0x3,
-    NVME_SGL_DESCR_TYPE_KEYED_DATA_BLOCK    = 0x4,
+    NVME_SGL_DESCR_TYPE_DATA_BLOCK           = 0x0,
+    NVME_SGL_DESCR_TYPE_BIT_BUCKET           = 0x1,
+    NVME_SGL_DESCR_TYPE_SEGMENT              = 0x2,
+    NVME_SGL_DESCR_TYPE_LAST_SEGMENT         = 0x3,
+    NVME_SGL_DESCR_TYPE_KEYED_DATA_BLOCK     = 0x4,
+    NVME_SGL_DESCR_TYPE_TRANSPORT_DATA_BLOCK = 0x5,
 
-    NVME_SGL_DESCR_TYPE_VENDOR_SPECIFIC     = 0xf,
+    NVME_SGL_DESCR_TYPE_VENDOR_SPECIFIC      = 0xf,
 };
 
 enum NvmeSglDescriptorSubtype {
     NVME_SGL_DESCR_SUBTYPE_ADDRESS = 0x0,
+    NVME_SGL_DESCR_SUBTYPE_OFFSET  = 0x1,
 };
 
 typedef struct QEMU_PACKED NvmeSglDescriptor {
@@ -622,6 +624,7 @@ enum NvmeAdminCommands {
     NVME_ADM_CMD_FORMAT_NVM     = 0x80,
     NVME_ADM_CMD_SECURITY_SEND  = 0x81,
     NVME_ADM_CMD_SECURITY_RECV  = 0x82,
+    NVME_ADM_CMD_FABRICS        = 0x7f,
 };
 
 enum NvmeIoCommands {
