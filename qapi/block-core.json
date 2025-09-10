@@ -3275,7 +3275,7 @@
             'http', 'https',
             { 'name': 'io_uring', 'if': 'CONFIG_BLKIO' },
             'iscsi',
-            'luks', 'nbd', 'nfs', 'null-aio', 'null-co', 'nvme',
+            'luks', 'nbd', 'nfs', 'null-aio', 'null-co', 'nvme', 'nvme-tcp',
             { 'name': 'nvme-io_uring', 'if': 'CONFIG_BLKIO' },
             'parallels', 'preallocate', 'qcow', 'qcow2', 'qed', 'quorum',
             'raw', 'rbd',
@@ -4730,6 +4730,22 @@
             '*min-cluster-size': 'size' } }
 
 ##
+# @BlockdevOptionsNvmeTcp:
+#
+# @tgtsock: target socket address
+#
+# @subsysnqn: subsystem NQN
+#
+# @num-io-threads: number of blk dev IOThreads (default 1)
+#
+# Since: XXX
+##
+{ 'struct': 'BlockdevOptionsNvmeTcp',
+  'data': { 'tgtsock': 'InetSocketAddress',
+            'subsysnqn': 'str',
+            '*num-io-threads': 'size' } }
+
+##
 # @BlockdevOptions:
 #
 # Options for creating a block device.  Many options are available for
@@ -4814,6 +4830,7 @@
       'null-aio':   'BlockdevOptionsNull',
       'null-co':    'BlockdevOptionsNull',
       'nvme':       'BlockdevOptionsNVMe',
+      'nvme-tcp':   'BlockdevOptionsNvmeTcp',
       'nvme-io_uring': { 'type': 'BlockdevOptionsNvmeIoUring',
                          'if': 'CONFIG_BLKIO' },
       'parallels':  'BlockdevOptionsGenericFormat',
