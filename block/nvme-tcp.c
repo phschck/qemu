@@ -56,23 +56,36 @@
 
 #define RCTXRBUF_SIZE 512
 
-typedef struct NvmeTcpResponseCtx {
+typedef struct NvmeTcpReadInfo {
     QEMUIOVector *qiov;
+    uint32_t bytes_received;
+    bool last;
+} NvmeTcpReadInfo;
+
+typedef struct NvmeTcpR2tInfo {
+    uint32_t r2to;
+    uint32_t r2tl;
+    uint16_t ttag;
+} NvmeTcpR2tInfo;
+
+// TODO: put qiov and r2t shit in a union
+typedef struct NvmeTcpResponseCtx {
     Coroutine *co;
+    union {
+        NvmeTcpReadInfo *readinfo;
+        NvmeTcpR2tInfo *r2tinfo;
+    } u;
     bool exists; /* to prevent having to allocate and delete this all the time */
     bool io_done;
+    bool missing_read_data; /* data buffer fragmentation */
     bool co_waiting;
+    uint8_t expected_type;
 } NvmeTcpResponseCtx;
 
 typedef struct NvmeTcpQueue {
     QIOChannelSocket *sock;
     QemuThread thread;
 
-    /*
-     * as long as we don't yield in between releasing
-     * the wlock and locking the rlock, we should still
-     * be recieving the correct responses to our commands
-     */
     CoMutex wlock;
     CoMutex rlock;
 
@@ -103,11 +116,12 @@ typedef struct BDRVNVMeTCPState {
 
     uint16_t cntlid;
     bool write_cache_supported;
-    size_t page_size;
-    uint64_t max_transfer;
+    size_t page_size; /* in bytes */
+    uint64_t max_transfer; /* max bytes per io cmd */
     int nsid;
-    uint64_t nsze; /* Namespace size reported by identify command */
+    uint64_t nsze; /* namespace size in blocks */
     int blkshift;
+    unsigned ioccsz; /* max in-capsule data in bytes */
 
     /*
      * needed for refresh_filename()
@@ -180,7 +194,7 @@ static void nvme_tcp_parse_filename(const char *filename, QDict *options,
 
 #define NVME_TCP_HOST_DATA_ALIGNMENT 0
 #define NVME_TCP_HOST_DATA_ALIGNMENT_BYTES ((NVME_TCP_HOST_DATA_ALIGNMENT + 1) * 4)
-#define NVME_TCP_MAX_R2T 0 // 7 for 8 r2t max TODO XXX
+#define NVME_TCP_MAX_R2T 0 /* 0-based, important to conserve 1-1 ratio of cmds and responses */
 
 static size_t nvme_tcp_calculate_padding(const size_t len, const size_t alignment)
 {
@@ -348,13 +362,6 @@ static int coroutine_mixed_fn nvme_tcp_submit_commandv(NvmeTcpQueue *queue, Nvme
         iov[2 + i].iov_len = data[i].iov_len;
     }
 
-    // TODO
-    // what we absolutely need to do here is take queue->maxh2cdata into account
-    // and probably split cmd and data and wait for r2t in between for bigger writes
-    // (this requires a different SGL descriptor!!!)
-    // should be enough to check if big, if no send normally, if yes, loop
-    // wait for r2t, send, track bytes_sent
-
     // FIXME
     // we're never re-entering if we yield here i think
     // while (qemu_in_coroutine() && nvme_tcp_queue_size(queue) > queue->sqsize - 1) {
@@ -441,7 +448,7 @@ static int nvme_tcp_submit_command_and_await_completion(NvmeTcpQueue *queue, Nvm
     if (rc) {
         return rc;
     }
-    if (completion->command_id != cmd->cid) {
+    if (completion->cid != cmd->cid) {
         error_setg(errp, "Received reply to wrong command!");
         rc = -EIO; // TODO: better error code
     }
@@ -469,11 +476,11 @@ static int coroutine_mixed_fn __nvme_tcp_await_datav(NvmeTcpQueue *queue, struct
         error_setg(errp, "Received padding or digest, unsupported.");
         return -ENOTSUP; // TODO
         }
-    if (le32_to_cpu(data_pdu.data_length) != len) {
-        error_setg(errp, "Hdr length field %d instead of %ld!", data_pdu.data_length, len);
+    if (le32_to_cpu(data_pdu.datal) != len) {
+        error_setg(errp, "Hdr length field %d instead of %ld!", data_pdu.datal, len);
         return -EIO; // TODO
     }
-    if (le32_to_cpu(data_pdu.data_offset) != 0) {
+    if (le32_to_cpu(data_pdu.datao) != 0) {
         // TODO
         error_setg(errp, "Received data with offset, unsupported.");
         return -ENOTSUP; // TODO
@@ -483,8 +490,8 @@ static int coroutine_mixed_fn __nvme_tcp_await_datav(NvmeTcpQueue *queue, struct
         error_setg(errp, "Received data with unsupported flags.");
         return -ENOTSUP; // TODO
     }
-    if (le16_to_cpu(data_pdu.command_id) != cid) {
-        error_setg(errp, "Received data for wrong command (0x%04x instead of 0x%04x)", data_pdu.command_id, cid);
+    if (le16_to_cpu(data_pdu.cid) != cid) {
+        error_setg(errp, "Received data for wrong command (0x%04x instead of 0x%04x)", data_pdu.cid, cid);
         return -EIO;
     }
 
@@ -611,7 +618,7 @@ static int nvme_tcp_property_set32(NvmeTcpQueue *queue, uint32_t offset, uint32_
 //     NvmfPropertySetCmd cmd = {
 //         .opcode = NVME_ADM_CMD_FABRICS,
 //         .resv1 = 0x00,
-//         .command_id = cpu_to_le16(queue->next_command_id++),
+//         .cid = cpu_to_le16(queue->next_cid++),
 //         .fctype = NVME_FCTYPE_PROPERTY_SET,
 //         .attrib = 0x01, /* 8 bytes value */
 //         .offset = cpu_to_le32(offset),
@@ -732,20 +739,15 @@ static int __nvme_tcp_open(BlockDriverState *bs, Error **errp)
         return rc;
     }
     NvmeIdCtrl id_ctrl;
-    rc = nvme_tcp_await_data(s->admin_queue, &id_ctrl, sizeof(id_ctrl), le16_to_cpu(identify_cmd.command_id), errp);
+    rc = nvme_tcp_await_data(s->admin_queue, &id_ctrl, sizeof(id_ctrl), le16_to_cpu(identify_cmd.cid), errp);
     if (rc != 0) {
         error_prepend(errp, "Failed to identify controller! ");
         return rc;
     }
     // TODO: copy more of these from nvme.c
     s->write_cache_supported = le32_to_cpu(id_ctrl.vwc) & 0x1;
-    // TODO FIXME XXX
-    s->max_transfer = s->page_size;
-    // s->max_transfer = (id_ctrl.mdts ? 1 << id_ctrl.mdts : 0) * s->page_size;
-    // /* For now the page list buffer per command is one page, to hold at most
-    //  * s->page_size / sizeof(uint64_t) entries. */
-    // s->max_transfer = MIN_NON_ZERO(s->max_transfer,
-    //                       s->page_size / sizeof(uint64_t) * s->page_size);
+    s->max_transfer = (id_ctrl.mdts ? 1 << id_ctrl.mdts : 0) * s->page_size;
+    s->ioccsz = le32_to_cpu(id_ctrl.ioccsz) * 16;
 
     // TODO: add more handshaky config exchange from kernel driver for fun
 
@@ -766,7 +768,7 @@ static int __nvme_tcp_open(BlockDriverState *bs, Error **errp)
         return rc;
     }
     NvmeIdNs id_ns;
-    rc = nvme_tcp_await_data(s->admin_queue, &id_ns, sizeof(id_ns), le16_to_cpu(identify_ns_cmd.command_id), errp);
+    rc = nvme_tcp_await_data(s->admin_queue, &id_ns, sizeof(id_ns), le16_to_cpu(identify_ns_cmd.cid), errp);
     if (rc != 0) {
         error_prepend(errp, "Failed to identify ns: ");
         return rc;
@@ -945,20 +947,39 @@ static NvmeTcpResponseCtx coroutine_fn *nvme_tcp_rctxrbuf_get(NvmeTcpQueue *q, u
     return entry;
 }
 
-static void coroutine_fn nvme_tcp_rctxrbuf_register(NvmeTcpQueue *q, uint16_t cid, QEMUIOVector *qiov)
+static void coroutine_fn nvme_tcp_rctxrbuf_register(NvmeTcpQueue *q, uint16_t cid, NvmeTcpReadInfo *readinfo, NvmeTcpR2tInfo *r2tinfo, uint8_t expected_type)
 {
     NvmeTcpResponseCtx *rctx = nvme_tcp_rctxrbuf_get(q, cid);
     rctx->exists = true;
-    rctx->qiov = qiov;
     rctx->co = qemu_coroutine_self();
+    if (readinfo) {
+        assert(!r2tinfo);
+        rctx->u.readinfo = readinfo;
+    }
+    if (r2tinfo) {
+        assert(!readinfo);
+        rctx->u.r2tinfo = r2tinfo;
+    }
+    rctx->missing_read_data = false;
     rctx->io_done = false;
     rctx->co_waiting = false;
+    rctx->expected_type = expected_type;
 }
 
-static void coroutine_fn nvme_tcp_cbrbuf_deregister(NvmeTcpQueue *q, uint16_t cid)
+static void coroutine_fn nvme_tcp_rctxrbuf_refresh(NvmeTcpQueue *q, uint16_t cid, uint8_t expected_type)
 {
-    assert(nvme_tcp_rctxrbuf_get(q, cid)->exists);
-    nvme_tcp_rctxrbuf_get(q, cid)->exists = false;
+    NvmeTcpResponseCtx *rctx = nvme_tcp_rctxrbuf_get(q, cid);
+    assert(rctx->exists);
+    rctx->io_done = false;
+    rctx->co_waiting = false;
+    rctx->expected_type = expected_type;
+}
+
+static void coroutine_fn nvme_tcp_rctxrbuf_deregister(NvmeTcpQueue *q, uint16_t cid)
+{
+    NvmeTcpResponseCtx *rctx = nvme_tcp_rctxrbuf_get(q, cid);
+    assert(rctx->exists);
+    rctx->exists = false;
     while (q->rctxrbuf[q->rctxrbuf_tail_idx].exists == false) {
         q->rctxrbuf_tail_idx++;
         q->rctxrbuf_tail_cid++;
@@ -969,20 +990,26 @@ static int coroutine_fn nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_
 {
     ERRP_GUARD();
     NvmfCompletion cqe;
-    NvmeTcpDataPdu data_pdu;
+    union {
+        NvmeTcpDataPdu data;
+        NvmeTcpR2tPdu r2t;
+    } pdu;
     NvmeTcpResponseCtx *our_rctx = nvme_tcp_rctxrbuf_get(q, our_cid);
     NvmeTcpResponseCtx *their_rctx;
+    QEMUIOVector slice;
     uint16_t their_cid;
+    uint8_t received_type;
     int rc;
 
     WITH_QEMU_LOCK_GUARD(&q->rlock) {
-        rc = nvme_tcp_recv(q, &data_pdu.hdr, sizeof(NvmeTcpHdr), errp);
+        rc = nvme_tcp_recv(q, &pdu.data.hdr, sizeof(NvmeTcpHdr), errp);
         if (rc) {
             error_prepend(errp, "Failed to recv hdr: ");
             return rc;
         }
+        received_type = pdu.data.hdr.type;
 
-        switch (data_pdu.hdr.type) {
+        switch (received_type) {
             case NVME_TCP_PDUTYPE_CAPSULE_RESP:
                 rc = nvme_tcp_recv(q, &cqe, sizeof(cqe), errp);
                 if (rc) {
@@ -993,47 +1020,56 @@ static int coroutine_fn nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_
                     error_setg(errp, "Write/flush unsuccessful");
                     return -EIO;
                 }
-                their_cid = le16_to_cpu(cqe.command_id);
+                their_cid = le16_to_cpu(cqe.cid);
                 their_rctx = nvme_tcp_rctxrbuf_get(q, their_cid);
                 break;
 
             case NVME_TCP_PDUTYPE_C2HDATA:
-                rc = nvme_tcp_recv(q, ((uint8_t *) &data_pdu) + sizeof(NvmeTcpHdr), sizeof(data_pdu) - sizeof(NvmeTcpHdr), errp);
+                rc = nvme_tcp_recv(q, ((uint8_t *) &pdu.data) + sizeof(NvmeTcpHdr), sizeof(pdu.data) - sizeof(NvmeTcpHdr), errp);
                 if (rc) {
                     error_prepend(errp, "Failed to recv data pdu: ");
                     return rc;
                 }
-                if (!(data_pdu.hdr.flags & 0x08)) {
+                if (!(pdu.data.hdr.flags & 0x08)) {
                     error_setg(errp, "Read unsuccessful");
                     return -EIO;
                 }
-                if (!(data_pdu.hdr.flags & 0x04)) {
-                    error_setg(errp, "Read fragmented, not yet supported"); // TODO
-                    return -EIO;
-                }
-                if (data_pdu.hdr.hlen != data_pdu.hdr.pdo) {
+                if (pdu.data.hdr.hlen != pdu.data.hdr.pdo) {
                     // TODO
                     error_setg(errp, "Received padding or digest, unsupported.");
                     return -EIO;
                 }
-                if (le32_to_cpu(data_pdu.data_offset) != 0) {
-                    // TODO
-                    error_setg(errp, "Received data with offset, unsupported.");
-                    return -EIO;
-                }
 
-                their_cid = le16_to_cpu(data_pdu.command_id);
+                their_cid = le16_to_cpu(pdu.data.cid);
                 their_rctx = nvme_tcp_rctxrbuf_get(q, their_cid);
-                if (le32_to_cpu(data_pdu.data_length) != iov_size(their_rctx->qiov->iov, their_rctx->qiov->niov)) {
-                    error_setg(errp, "Received data pdu with unexpected length");
-                    return -EIO;
-                }
 
-                rc = qio_channel_readv_all(QIO_CHANNEL(q->sock), their_rctx->qiov->iov, their_rctx->qiov->niov, errp);
+                their_rctx->u.readinfo->last = !!(pdu.data.hdr.flags & 0x04);
+                their_rctx->u.readinfo->bytes_received += le32_to_cpu(pdu.data.datal);
+
+                qemu_iovec_init_slice(&slice, their_rctx->u.readinfo->qiov, le32_to_cpu(pdu.data.datao), le32_to_cpu(pdu.data.datal));
+
+                rc = qio_channel_readv_all(QIO_CHANNEL(q->sock), slice.iov, slice.niov, errp);
                 if (rc) {
                     error_prepend(errp, "Failed to recv data: ");
                     return rc;
                 }
+
+                qemu_iovec_destroy(&slice);
+                break;
+
+            case NVME_TCP_PDUTYPE_R2T:
+                rc = nvme_tcp_recv(q, ((uint8_t *) &pdu.r2t) + sizeof(NvmeTcpHdr), sizeof(pdu.r2t) - sizeof(NvmeTcpHdr), errp);
+                if (rc) {
+                    error_prepend(errp, "Failed to recv r2t pdu: ");
+                    return rc;
+                }
+
+                their_cid = le16_to_cpu(pdu.r2t.cid);
+                their_rctx = nvme_tcp_rctxrbuf_get(q, their_cid);
+
+                their_rctx->u.r2tinfo->ttag = le16_to_cpu(pdu.r2t.ttag);
+                their_rctx->u.r2tinfo->r2to = le32_to_cpu(pdu.r2t.r2to);
+                their_rctx->u.r2tinfo->r2tl = le32_to_cpu(pdu.r2t.r2tl);
                 break;
 
             default:
@@ -1041,9 +1077,14 @@ static int coroutine_fn nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_
         }
     }
 
+    if (their_rctx->expected_type != received_type) {
+        error_setg(errp, "Received wrong io response type");
+        return -EIO;
+    }
+
     /* we received our own response, done */
     if (their_cid == our_cid) {
-        goto done;
+        return 0;
     }
 
     our_rctx->co_waiting = true;
@@ -1056,26 +1097,22 @@ static int coroutine_fn nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_
 
     /* our i/o has already been completed by a different coroutine, done */
     if (our_rctx->io_done) {
-        goto done;
+        return 0;
     }
 
     /* wait for our i/o to be completed by a different coroutine */
     qemu_coroutine_yield();
     assert(our_rctx->io_done);
-
-done:
-    nvme_tcp_cbrbuf_deregister(q, our_cid);
     return 0;
 }
 
-static int coroutine_fn nvme_tcp_co_prwv(bool write, BlockDriverState *bs,
-    int64_t offset, int64_t bytes, QEMUIOVector *qiov)
+static int coroutine_fn nvme_tcp_co_submit_rwcmd(bool write, BDRVNVMeTCPState *s,
+    NvmeTcpQueue *q, int64_t offset, int64_t bytes, QEMUIOVector *qiov,
+    uint16_t *cid, Error **errp)
 {
-    BDRVNVMeTCPState *s = bs->opaque;
-    NvmeTcpQueue *q = nvme_tcp_get_io_queue_for_current_thread(s);
-    Error *err;
+    bool capsule_data = write && bytes <= s->ioccsz;
     NvmeSglDescriptor sgld = {
-        .type = write ? NVME_TCP_SGL_TYPE_DATA_BLOCK : NVME_TCP_SGL_TYPE_DATA_BUFFER,
+        .type = capsule_data ? NVME_TCP_SGL_TYPE_DATA_BLOCK : NVME_TCP_SGL_TYPE_DATA_BUFFER,
         .len = cpu_to_le32(bytes),
     };
     NvmeRwCmd cmd = {
@@ -1086,34 +1123,27 @@ static int coroutine_fn nvme_tcp_co_prwv(bool write, BlockDriverState *bs,
         .slba = cpu_to_le64(offset >> s->blkshift),
         .nlb = cpu_to_le16((bytes >> s->blkshift) - 1), /* 0-based */
     };
-    uint16_t cid;
     int rc;
 
+    assert(offset >= 0);
+    assert(bytes >= 0);
     assert(QEMU_IS_ALIGNED(offset, 1ULL << s->blkshift));
     assert(QEMU_IS_ALIGNED(bytes, 1ULL << s->blkshift));
 
     rc = nvme_tcp_submit_commandv(
         q,
         (NvmeCmd *) &cmd,
-        write ? qiov->iov : NULL,
-        write ? qiov->niov : 0,
-        write ? bytes : 0,
+        capsule_data ? qiov->iov : NULL,
+        capsule_data ? qiov->niov : 0,
+        capsule_data ? bytes : 0,
         false,
-        &err);
+        errp);
     if (rc) {
-        error_propagate_prepend(&error_abort, err, "Failed to submit rw cmd: ");
+        error_prepend(errp, "Failed to submit rw cmd: ");
         return rc;
     }
 
-    cid = le16_to_cpu(cmd.cid);
-    nvme_tcp_rctxrbuf_register(q, cid, write ? NULL : qiov);
-
-    rc = nvme_tcp_co_await_io_resp(q, cid, &err);
-    if (rc) {
-        error_propagate_prepend(&error_abort, err, "Failed to recv io resp: ");
-        return rc;
-    }
-
+    *cid = le16_to_cpu(cmd.cid);
     return 0;
 }
 
@@ -1121,14 +1151,123 @@ static int coroutine_fn nvme_tcp_co_preadv(BlockDriverState *bs,
     int64_t offset, int64_t bytes, QEMUIOVector *qiov,
     BdrvRequestFlags flags)
 {
-    return nvme_tcp_co_prwv(false, bs, offset, bytes, qiov);
+    BDRVNVMeTCPState *s = bs->opaque;
+    NvmeTcpQueue *q = nvme_tcp_get_io_queue_for_current_thread(s);
+    Error *err = NULL;
+    NvmeTcpReadInfo readinfo = {
+        .qiov = qiov,
+        .bytes_received = 0,
+        .last = false,
+    };
+    uint16_t cid;
+    int rc;
+
+    rc = nvme_tcp_co_submit_rwcmd(false, s, q, offset, bytes, qiov, &cid, &err);
+    if (rc) {
+        error_propagate(&error_abort, err);
+        return rc;
+    }
+
+    nvme_tcp_rctxrbuf_register(q, cid, &readinfo, NULL, NVME_TCP_PDUTYPE_C2HDATA);
+
+    while (!readinfo.last) {
+        rc = nvme_tcp_co_await_io_resp(q, cid, &err);
+        if (rc) {
+            error_propagate_prepend(&error_abort, err, "Failed to recv io resp: ");
+            return rc;
+        }
+    }
+    if (readinfo.bytes_received != qiov->size) {
+        error_setg(&err, "Received unexpected data length to read cmd");
+        error_propagate(&error_abort, err);
+    }
+
+    nvme_tcp_rctxrbuf_deregister(q, cid);
+    return 0;
 }
 
 static int coroutine_fn nvme_tcp_co_pwritev(
     BlockDriverState *bs, int64_t offset, int64_t bytes, QEMUIOVector *qiov,
     BdrvRequestFlags flags)
 {
-    return nvme_tcp_co_prwv(true, bs, offset, bytes, qiov);
+    BDRVNVMeTCPState *s = bs->opaque;
+    NvmeTcpQueue *q = nvme_tcp_get_io_queue_for_current_thread(s);
+    Error *err = NULL;
+    NvmeTcpR2tInfo r2tinfo;
+    uint64_t bytes_sent = 0;
+    bool capsule_data = bytes <= s->ioccsz;
+    uint16_t cid;
+    int rc;
+
+    rc = nvme_tcp_co_submit_rwcmd(true, s, q, offset, bytes, capsule_data ? qiov : NULL, &cid, &err);
+    if (rc) {
+        error_propagate(&error_abort, err);
+        return rc;
+    }
+
+    nvme_tcp_rctxrbuf_register(q, cid, NULL, capsule_data ? NULL : &r2tinfo,
+        capsule_data ? NVME_TCP_PDUTYPE_CAPSULE_RESP : NVME_TCP_PDUTYPE_R2T);
+    rc = nvme_tcp_co_await_io_resp(q, cid, &err);
+    if (rc) {
+        error_propagate_prepend(&error_abort, err, "Failed to recv io resp: ");
+        return rc;
+    }
+
+    if (!capsule_data) {
+        NvmeTcpDataPdu data_pdu = {
+            .hdr = {
+                .type = NVME_TCP_PDUTYPE_H2CDATA,
+                .hlen = 24,
+                .pdo = 24,
+            },
+            .cid = cpu_to_le16(cid),
+            .ttag = cpu_to_le16(r2tinfo.ttag),
+        };
+        QEMUIOVector h2cdatavec;
+        uint32_t datal;
+        bool last = false;
+
+        while (bytes_sent < bytes) {
+            while (r2tinfo.r2tl) {
+                assert(r2tinfo.r2tl <= bytes - bytes_sent);
+                datal = MIN(r2tinfo.r2tl, q->maxh2cdata);
+                last = (bytes_sent + datal) >= bytes;
+
+                data_pdu.hdr.flags = last ? 0x04 : 0;
+                data_pdu.hdr.plen = cpu_to_le32(data_pdu.hdr.pdo + datal);
+                data_pdu.datao = cpu_to_le32(bytes_sent);
+                data_pdu.datal = cpu_to_le32(datal);
+
+                qemu_iovec_init(&h2cdatavec, qiov->niov);
+                qemu_iovec_add(&h2cdatavec, &data_pdu, sizeof(data_pdu));
+                qemu_iovec_concat(&h2cdatavec, qiov, bytes_sent, datal);
+
+                nvme_tcp_rctxrbuf_refresh(q, cid,
+                    last ? NVME_TCP_PDUTYPE_CAPSULE_RESP : NVME_TCP_PDUTYPE_R2T);
+
+                qemu_co_mutex_lock(&q->wlock);
+                rc = qio_channel_writev_all(QIO_CHANNEL(q->sock), h2cdatavec.iov, h2cdatavec.niov, &err);
+                qemu_co_mutex_unlock(&q->wlock);
+                if (rc) {
+                    error_propagate_prepend(&error_abort, err, "Failed to send h2cdata: ");
+                    return rc;
+                }
+
+                bytes_sent += datal;
+                r2tinfo.r2tl -= datal;
+                qemu_iovec_destroy(&h2cdatavec);
+            }
+
+            rc = nvme_tcp_co_await_io_resp(q, cid, &err);
+            if (rc) {
+                error_propagate_prepend(&error_abort, err, "Failed to recv io resp: ");
+                return rc;
+            }
+        }
+    }
+
+    nvme_tcp_rctxrbuf_deregister(q, cid);
+    return 0;
 }
 
 static coroutine_fn int __nvme_tcp_co_flush(BDRVNVMeTCPState *s, NvmeTcpQueue *q, BlockDriverState *bs, Error **errp)
@@ -1163,13 +1302,13 @@ static coroutine_fn int __nvme_tcp_co_flush(BDRVNVMeTCPState *s, NvmeTcpQueue *q
     }
 
     cid = le16_to_cpu(cmd.cid);
-    nvme_tcp_rctxrbuf_register(q, cid, NULL);
-
+    nvme_tcp_rctxrbuf_register(q, cid, NULL, NULL, NVME_TCP_PDUTYPE_CAPSULE_RESP);
     rc = nvme_tcp_co_await_io_resp(q, cid, &err);
     if (rc) {
         error_prepend(errp, "No flush cmd cqe: ");
         return rc;
     }
+    nvme_tcp_rctxrbuf_deregister(q, cid);
 
     return 0;
 }

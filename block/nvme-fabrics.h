@@ -8,7 +8,7 @@
 typedef struct QEMU_PACKED NvmfConnectCommand {
     uint8_t     opcode;
     uint8_t     resv1;
-    uint16_t    command_id;
+    uint16_t    cid;
     uint8_t     fctype;
     uint8_t     resv2[19];
     NvmeCmdDptr dptr;
@@ -33,7 +33,7 @@ typedef struct QEMU_PACKED NvmfConnectData {
 typedef struct QEMU_PACKED NvmfIdentify {
     uint8_t     opcode;
     uint8_t     flags;
-    uint16_t    command_id;
+    uint16_t    cid;
     uint32_t    nsid;
     uint64_t    rsvd2[2];
     NvmeCmdDptr dptr;
@@ -49,7 +49,7 @@ typedef struct QEMU_PACKED NvmfIdentify {
 typedef struct QEMU_PACKED NvmfPropertyGetCmd {
     uint8_t  opcode;
     uint8_t  resv1;
-    uint16_t command_id;
+    uint16_t cid;
     uint8_t  fctype;
     uint8_t  resv2[35];
     uint8_t  attrib;
@@ -61,7 +61,7 @@ typedef struct QEMU_PACKED NvmfPropertyGetCmd {
 typedef struct QEMU_PACKED NvmfPropertySetCmd {
     uint8_t  opcode;
     uint8_t  resv1;
-    uint16_t command_id;
+    uint16_t cid;
     uint8_t  fctype;
     uint8_t  resv2[35];
     uint8_t  attrib;
@@ -80,7 +80,7 @@ typedef struct QEMU_PACKED NvmfCompletion {
     } result;
     uint16_t sq_head;    /* how much of this queue may be reclaimed */
     uint16_t sq_id;      /* submission queue that generated this entry */
-    uint16_t command_id; /* of the command which completed */
+    uint16_t cid; /* of the command which completed */
     uint16_t status;     /* did the command fail, and if so, why? */
 } NvmfCompletion;
 
@@ -97,7 +97,7 @@ static inline int nvmf_translate_error(const NvmfCompletion *c, void (*trace)(ui
         trace(le64_to_cpu(c->result.u64),
               le16_to_cpu(c->sq_head),
               le16_to_cpu(c->sq_id),
-              le16_to_cpu(c->command_id),
+              le16_to_cpu(c->cid),
               le16_to_cpu(status));
     }
     switch (status) {

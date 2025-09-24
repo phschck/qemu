@@ -13,6 +13,7 @@ enum NvmeTcpPduType {
     NVME_TCP_PDUTYPE_CAPSULE_RESP = 0x05,
     NVME_TCP_PDUTYPE_H2CDATA = 0x06,
     NVME_TCP_PDUTYPE_C2HDATA = 0x07,
+    NVME_TCP_PDUTYPE_R2T = 0x09,
 };
 
 enum NvmeTcpHlen {
@@ -76,20 +77,38 @@ typedef struct QEMU_PACKED NvmeTcpIcrespPdu {
 } NvmeTcpIcrespPdu;
 
 /**
+ * struct NvmeTcpR2tPdu - nvme tcp ready-to-transfer pdu
+ *
+ * @hdr:           pdu common header
+ * @cid:           nvme command identifier which this relates to
+ * @ttag:          transfer tag (controller generated)
+ * @r2t_offset:    offset from the start of the command data
+ * @r2t_length:    length the host is allowed to send
+ */
+typedef struct QEMU_PACKED NvmeTcpR2tPdu {
+    struct NvmeTcpHdr hdr;
+    uint16_t          cid;
+    uint16_t          ttag;
+    uint32_t          r2to;
+    uint32_t          r2tl;
+    uint8_t           rsvd[4];
+} NvmeTcpR2tPdu;
+
+/**
  * struct NvmeTcpDataPdu - nvme tcp data pdu
  *
  * @hdr:           pdu common header
- * @command_id:    nvme command identifier which this relates to
+ * @cid:           nvme command identifier which this relates to
  * @ttag:          transfer tag (controller generated)
  * @data_offset:   offset from the start of the command data
  * @data_length:   length of the data stream
  */
 typedef struct QEMU_PACKED NvmeTcpDataPdu {
     NvmeTcpHdr hdr;
-    uint16_t   command_id;
+    uint16_t   cid;
     uint16_t   ttag;
-    uint32_t   data_offset;
-    uint32_t   data_length;
+    uint32_t   datao;
+    uint32_t   datal;
     uint8_t    rsvd[4];
 } NvmeTcpDataPdu;
 
