@@ -4736,13 +4736,16 @@
 #
 # @subsysnqn: subsystem NQN
 #
-# @num-io-threads: number of blk dev IOThreads (default 1)
+# @nsid: namespace id (default 1)
+#
+# @num-io-threads: number of blk dev IOThreads (default 0)
 #
 # Since: XXX
 ##
 { 'struct': 'BlockdevOptionsNvmeTcp',
   'data': { 'tgtsock': 'InetSocketAddress',
             'subsysnqn': 'str',
+            '*nsid': 'uint32',
             '*num-io-threads': 'size' } }
 
 ##
