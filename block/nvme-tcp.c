@@ -48,65 +48,20 @@
  * - alignment other than 0
  * - fix indents, wrap long lines, sort includes,...
  * - correctly free everything on (early) exit
- * - make ioq iothread mapping cache friendlier
  * - don't error_abort outside of startup
  * - improve tracing (less with every cmd, more with config and state changes)
  * - make iothread-ioqueue-mapping a less hacky startup thing, like iothread-vq-mapping
+ * - make ioq iothread mapping cache friendlier
+ * - finally figure out why the sgl flag is 0x40 instead of 0x80
  * - everything indicated with // comments
  */
 
-#define RCTXRBUF_SIZE 512
-
-typedef struct NvmeTcpReadInfo {
-    QEMUIOVector *qiov;
-    uint32_t bytes_received;
-    bool last;
-} NvmeTcpReadInfo;
-
-typedef struct NvmeTcpR2tInfo {
-    uint32_t r2to;
-    uint32_t r2tl;
-    uint16_t ttag;
-} NvmeTcpR2tInfo;
-
-// TODO: put qiov and r2t shit in a union
-typedef struct NvmeTcpResponseCtx {
-    Coroutine *co;
-    union {
-        NvmeTcpReadInfo *readinfo;
-        NvmeTcpR2tInfo *r2tinfo;
-    } u;
-    bool exists; /* to prevent having to allocate and delete this all the time */
-    bool io_done;
-    bool missing_read_data; /* data buffer fragmentation */
-    bool co_waiting;
-    uint8_t expected_type;
-} NvmeTcpResponseCtx;
-
-typedef struct NvmeTcpQueue {
-    QIOChannelSocket *sock;
-    QemuThread thread;
-
-    CoMutex wlock;
-    CoMutex rlock;
-
-    NvmeTcpResponseCtx rctxrbuf[RCTXRBUF_SIZE];
-    unsigned rctxrbuf_tail_idx;
-    uint16_t rctxrbuf_tail_cid;
-
-    uint16_t qid;
-    uint16_t next_cid;
-
-    unsigned sqsize;
-
-    uint8_t controller_alignment_bytes;
-    uint32_t maxh2cdata;
-} NvmeTcpQueue;
+typedef struct NvmeTcpQueue NvmeTcpQueue;
 
 typedef struct BDRVNVMeTCPState {
     NvmeTcpQueue *admin_queue;
 
-    QemuMutex thread_ioq_mapping_wlock; /* reads should be disjoint enough to not need locking i think */
+    QemuMutex thread_ioq_mapping_wlock; /* reads should be disjoint */
     NvmeTcpQueue **io_queues;
     unsigned next_unused_io_q; /* protected by thread_ioq_mapping_wlock */
     unsigned max_num_io_queues;
@@ -140,6 +95,54 @@ typedef struct BDRVNVMeTCPState {
     char *subsysnqn;
     unsigned num_io_threads;
 } BDRVNVMeTCPState;
+
+typedef struct NvmeTcpReadInfo {
+    QEMUIOVector *qiov;
+    uint32_t bytes_received;
+    bool last;
+} NvmeTcpReadInfo;
+
+typedef struct NvmeTcpR2tInfo {
+    uint32_t r2to;
+    uint32_t r2tl;
+    uint16_t ttag;
+} NvmeTcpR2tInfo;
+
+// TODO: put qiov and r2t shit in a union
+typedef struct NvmeTcpResponseCtx {
+    Coroutine *co;
+    union {
+        NvmeTcpReadInfo *readinfo;
+        NvmeTcpR2tInfo *r2tinfo;
+    } u;
+    bool exists; /* to prevent having to allocate and delete this all the time */
+    bool io_done;
+    bool missing_read_data; /* data buffer fragmentation */
+    bool co_waiting;
+    uint8_t expected_type;
+} NvmeTcpResponseCtx;
+
+#define RCTXRBUF_SIZE 512
+
+struct NvmeTcpQueue {
+    QIOChannelSocket *sioc;
+    QemuThread thread;
+
+    CoMutex wlock;
+    CoMutex rlock;
+
+    NvmeTcpResponseCtx rctxrbuf[RCTXRBUF_SIZE];
+    unsigned rctxrbuf_tail_idx;
+    uint16_t rctxrbuf_tail_cid;
+
+    uint16_t qid;
+    uint16_t next_cid;
+
+    unsigned sqsize; // TODO
+
+    uint8_t controller_alignment_bytes;
+    uint32_t maxh2cdata;
+};
 
 #define NVME_TCP_BLOCK_OPT_IP "tgtsock.host"
 #define NVME_TCP_BLOCK_OPT_PORT "tgtsock.port"
@@ -215,17 +218,22 @@ static size_t nvme_tcp_calculate_padding(const size_t len, const size_t alignmen
 // (maybe rename it to connect_to_disk/target or establish_initial_connections)
 // (or reconnect or whatever or just nvme_tcp_connect)
 // see chapter 9.6 in the base spec!!!!!!
-static int coroutine_mixed_fn nvme_tcp_sendv(NvmeTcpQueue *queue, const struct iovec *iov, size_t niov, size_t len, Error **errp)
+/**
+ * Place an entire entry into the submission queue of @q.
+ * DO NOT split entries over multiple iovecs in a coroutine context!
+ * Locks and unlocks @q->wlock appropiately if in coroutine.
+ */
+static coroutine_mixed_fn int nvme_tcp_sendv(NvmeTcpQueue *q, const struct iovec *iov, size_t niov, Error **errp)
 {
     ERRP_GUARD();
     int rc;
 
     if (qemu_in_coroutine()) {
-        qemu_co_mutex_lock(&queue->wlock);
+        qemu_co_mutex_lock(&q->wlock);
     }
-    rc = qio_channel_writev_all(QIO_CHANNEL(queue->sock), iov, niov, errp);
+    rc = qio_channel_writev_all(QIO_CHANNEL(q->sioc), iov, niov, errp);
     if (qemu_in_coroutine()) {
-        qemu_co_mutex_unlock(&queue->wlock);
+        qemu_co_mutex_unlock(&q->wlock);
     }
     if (rc) {
         error_prepend(errp, "Write error: ");
@@ -235,17 +243,27 @@ static int coroutine_mixed_fn nvme_tcp_sendv(NvmeTcpQueue *queue, const struct i
     return 0;
 }
 
-static int coroutine_mixed_fn nvme_tcp_send(NvmeTcpQueue *queue, const void *buf, size_t len, Error **errp)
+/**
+ * Convenience wrapper for nvme_tcp_sendv()
+ */
+static coroutine_mixed_fn int nvme_tcp_send(NvmeTcpQueue *q, const void *buf, size_t len, Error **errp)
 {
     struct iovec iov = { .iov_base = (void *) buf, .iov_len = len};
-    return nvme_tcp_sendv(queue, &iov, 1, len, errp);
+    return nvme_tcp_sendv(q, &iov, 1, errp);
 }
 
-static int coroutine_mixed_fn nvme_tcp_recv(NvmeTcpQueue *queue, void *buf, size_t len, Error **errp) {
+/**
+ * Read from the completion queue of @q
+ * Does NOT take @q->rlock, so this can be used to read pieces
+ * of a cq entry one at a time (especially for parsing headers).
+ * In a coroutine context, all calls of this associated with one sq entry
+ * MUST be between a lock and unlock of @q->rlock
+ */
+static coroutine_mixed_fn int nvme_tcp_recv(NvmeTcpQueue *q, void *buf, size_t len, Error **errp) {
     ERRP_GUARD();
     int rc;
 
-    rc = qio_channel_read_all(QIO_CHANNEL(queue->sock), buf, len, errp);
+    rc = qio_channel_read_all(QIO_CHANNEL(q->sioc), buf, len, errp);
     if (rc) {
         error_prepend(errp, "Recv error: ");
     }
@@ -254,20 +272,20 @@ static int coroutine_mixed_fn nvme_tcp_recv(NvmeTcpQueue *queue, void *buf, size
 }
 
 /**
- * Set up NVMe/TCP transport association for @queue.
- * Partially initialize @queue, set up TCP-connection,
- * send and receive icreq, icresp.
+ * Set up NVMe/TCP transport association for @q.
+ * Partially initialize @q, set up TCP-connection,
+ * send and receive ICReq, ICResp.
  */
-static int nvme_tcp_queue_transport_connect(BDRVNVMeTCPState *s, NvmeTcpQueue *queue, uint16_t qid, Error **errp)
+static int nvme_tcp_queue_transport_connect(BDRVNVMeTCPState *s, NvmeTcpQueue *q, uint16_t qid, Error **errp)
 {
     ERRP_GUARD();
     int rc;
 
     // TODO: keep alive timer config? -> higher than kato
-    queue->sock = qio_channel_socket_new();
-    queue->qid = qid;
+    q->sioc = qio_channel_socket_new();
+    q->qid = qid;
 
-    rc = qio_channel_socket_connect_sync(queue->sock, &s->tgtsock, errp);
+    rc = qio_channel_socket_connect_sync(q->sioc, &s->tgtsock, errp);
     if (rc) {
         error_prepend(errp, "Could not establish TCP connection with target: ");
         return rc;
@@ -284,18 +302,18 @@ static int nvme_tcp_queue_transport_connect(BDRVNVMeTCPState *s, NvmeTcpQueue *q
         .maxr2t = cpu_to_le32(NVME_TCP_MAX_R2T),
     };
 
-    rc = nvme_tcp_send(queue, &icreq, sizeof(icreq), errp);
+    rc = nvme_tcp_send(q, &icreq, sizeof(icreq), errp);
     if (rc) {
         error_prepend(errp, "Failed sending icreq: ");
         return rc;
     }
-    rc = qio_channel_flush(QIO_CHANNEL(queue->sock), errp);
+    rc = qio_channel_flush(QIO_CHANNEL(q->sioc), errp);
     if (rc) {
         return rc;
     }
 
     NvmeTcpIcrespPdu icresp;
-    rc = nvme_tcp_recv(queue, &icresp, sizeof(icresp), errp);
+    rc = nvme_tcp_recv(q, &icresp, sizeof(icresp), errp);
     if (rc) {
         error_prepend(errp, "Failed receiving icresp: ");
         return rc;
@@ -305,10 +323,10 @@ static int nvme_tcp_queue_transport_connect(BDRVNVMeTCPState *s, NvmeTcpQueue *q
      * TODO: should probably assert some icresp fields
      * (and check the following are within bounds)
      */
-    queue->controller_alignment_bytes = (icresp.cpda + 1) * 4;
-    queue->maxh2cdata = le32_to_cpu(icresp.maxdata);
+    q->controller_alignment_bytes = (icresp.cpda + 1) * 4;
+    q->maxh2cdata = le32_to_cpu(icresp.maxdata);
 
-    trace_nvmf_tcp_transport_connect(NVME_TCP_HOST_DATA_ALIGNMENT_BYTES, queue->controller_alignment_bytes, queue->maxh2cdata);
+    trace_nvmf_tcp_transport_connect(NVME_TCP_HOST_DATA_ALIGNMENT_BYTES, q->controller_alignment_bytes, q->maxh2cdata);
 
     /*
      * - admin queue is set blocking, as performance isn't very relevant during
@@ -319,32 +337,39 @@ static int nvme_tcp_queue_transport_connect(BDRVNVMeTCPState *s, NvmeTcpQueue *q
      *   as the only thing this queue does later is flushing
      *   TODO: change this later on if it is the only io queue of the only io thread
      */
-    qio_channel_set_blocking(QIO_CHANNEL(queue->sock), qid <= 1, errp);
-    qio_channel_set_follow_coroutine_ctx(QIO_CHANNEL(queue->sock), true);
+    qio_channel_set_blocking(QIO_CHANNEL(q->sioc), qid <= 1, errp);
+    qio_channel_set_follow_coroutine_ctx(QIO_CHANNEL(q->sioc), true);
 
     return 0;
 }
 
-static inline uint16_t coroutine_mixed_fn nvme_tcp_queue_size(NvmeTcpQueue *q)
+// TOOD:
+static inline coroutine_mixed_fn uint16_t nvme_tcp_queue_size(NvmeTcpQueue *q)
 {
     return q->next_cid - q->rctxrbuf_tail_cid;
 }
 
-static int coroutine_mixed_fn nvme_tcp_submit_commandv(NvmeTcpQueue *queue, NvmeCmd *cmd, const struct iovec *data, const size_t data_niov, size_t data_len, bool flush, Error **errp)
+/**
+ * Submits a command to the submission queue of @q
+ * Optional @data @data_niov carry in-capsule data.
+ * @flush MUST be true for admin/setup commands and false for i/o.
+ * Coroutine-safe, takes @q->wlock
+ */
+static coroutine_mixed_fn int nvme_tcp_submit_commandv(NvmeTcpQueue *q, NvmeCmd *cmd, const struct iovec *data, const size_t data_niov, size_t data_len, bool flush, Error **errp)
 {
     ERRP_GUARD();
     g_autofree struct iovec *iov;
-    size_t pad_len;
     size_t niov;
-    int rc;
-
     NvmeTcpHdr hdr = {
         .type = NVME_TCP_PDUTYPE_CAPSULE_CMD,
         .hlen = NVME_TCP_HLEN_CAPSULE_CMD,
     };
+    size_t pad_len;
+    int rc;
 
     if (data) {
-        pad_len = nvme_tcp_calculate_padding(hdr.hlen, queue->controller_alignment_bytes);
+        assert(cmd->dptr.sgl.type == NVME_TCP_SGL_TYPE_DATA_BLOCK);
+        pad_len = nvme_tcp_calculate_padding(hdr.hlen, q->controller_alignment_bytes);
         assert(pad_len == 0); // not yet supported
         hdr.pdo = sizeof(hdr) + sizeof(NvmeCmd) + pad_len;
         hdr.plen = hdr.pdo + data_len; // note: this differs if a digest is used
@@ -357,10 +382,11 @@ static int coroutine_mixed_fn nvme_tcp_submit_commandv(NvmeTcpQueue *queue, Nvme
 
         niov = 2;
     }
-    iov = g_malloc(sizeof(struct iovec) * niov);
+    iov = g_new(struct iovec, niov);
 
     iov[0].iov_base = &hdr;
     iov[0].iov_len = sizeof(hdr);
+
 
     iov[1].iov_base = cmd;
     iov[1].iov_len = sizeof(NvmeCmd);
@@ -377,24 +403,28 @@ static int coroutine_mixed_fn nvme_tcp_submit_commandv(NvmeTcpQueue *queue, Nvme
     //     qemu_coroutine_yield();
     // }
 
-    cmd->cid = cpu_to_le16(queue->next_cid++);
-    trace_nvmf_tcp_submit_command(queue->qid, cmd->opcode, cmd->cid, data_len, pad_len);
+    cmd->cid = cpu_to_le16(q->next_cid++);
+    trace_nvmf_tcp_submit_command(q->qid, cmd->opcode, cmd->cid, data_len, pad_len);
 
-    rc = nvme_tcp_sendv(queue, iov, niov, sizeof(NvmeTcpHdr) + sizeof(NvmeCmd) + data_len, errp);
+    rc = nvme_tcp_sendv(q, iov, niov, errp);
     if (rc) {
-        error_prepend(errp, "Submitting %s command (opcode 0x%02x) failed: ", queue->qid == 0 ? "admin" : "io", cmd->opcode);
+        error_prepend(errp, "Submitting %s command (opcode 0x%02x) failed: ", q->qid == 0 ? "admin" : "io", cmd->opcode);
+        return rc;
     }
 
     if (flush) {
-        rc = qio_channel_flush(QIO_CHANNEL(queue->sock), errp);
+        rc = qio_channel_flush(QIO_CHANNEL(q->sioc), errp);
         if (rc) {
             return rc;
         }
     }
 
-    return rc;
+    return 0;
 }
 
+/**
+ * Convenience wrapper of nvme_tcp_submit_commandv()
+ */
 static inline int coroutine_mixed_fn nvme_tcp_submit_command(NvmeTcpQueue *queue, NvmeCmd *cmd, void *data, size_t data_len, bool flush, Error **errp)
 {
     if (data) {
@@ -413,13 +443,13 @@ static inline int coroutine_mixed_fn nvme_tcp_submit_command(NvmeTcpQueue *queue
 // (luckily traffic remains separated by queues per definition, so it's enough to "register"
 // expected packets within a queue)
 // see chapter 9.6 in the base spec!!!!!!
-static int coroutine_mixed_fn __nvme_tcp_await_completion(NvmeTcpQueue *queue, NvmfCompletion *completion, Error **errp)
+static int nvme_tcp_await_completion(NvmeTcpQueue *q, NvmfCompletion *completion, Error **errp)
 {
     ERRP_GUARD();
     NvmeTcpHdr hdr;
     int rc = 0;
 
-    rc = nvme_tcp_recv(queue, &hdr, sizeof(hdr), errp);
+    rc = nvme_tcp_recv(q, &hdr, sizeof(hdr), errp);
     if (rc) {
         error_prepend(errp, "Failed recv hdr for cqe: ");
         return rc;
@@ -429,7 +459,7 @@ static int coroutine_mixed_fn __nvme_tcp_await_completion(NvmeTcpQueue *queue, N
         return -EIO;
     }
 
-    rc = nvme_tcp_recv(queue, completion, sizeof(NvmfCompletion), errp);
+    rc = nvme_tcp_recv(q, completion, sizeof(NvmfCompletion), errp);
     if (rc) {
         error_prepend(errp, "Failed to recv cqe: ");
         return rc;
@@ -439,16 +469,14 @@ static int coroutine_mixed_fn __nvme_tcp_await_completion(NvmeTcpQueue *queue, N
     return nvmf_translate_error(completion, trace_nvmf_tcp_error);
 }
 
-static int nvme_tcp_await_completion(NvmeTcpQueue *queue, NvmfCompletion *completion, Error **errp)
-{
-    return __nvme_tcp_await_completion(queue, completion, errp);
-}
-
-static int nvme_tcp_submit_command_and_await_completion(NvmeTcpQueue *queue, NvmeCmd *cmd, void *data, size_t data_len, bool flush, NvmfCompletion *completion, Error **errp)
+/**
+ * Helper function for setup commands where blocking is desired
+ */
+static int nvme_tcp_submit_command_and_await_completion(NvmeTcpQueue *queue, NvmeCmd *cmd, void *data, size_t data_len, NvmfCompletion *completion, Error **errp)
 {
     int rc;
 
-    rc = nvme_tcp_submit_command(queue, cmd, data, data_len, flush, errp);
+    rc = nvme_tcp_submit_command(queue, cmd, data, data_len, true, errp);
     if (rc) {
         return rc;
     }
@@ -459,13 +487,13 @@ static int nvme_tcp_submit_command_and_await_completion(NvmeTcpQueue *queue, Nvm
     }
     if (completion->cid != cmd->cid) {
         error_setg(errp, "Received reply to wrong command!");
-        rc = -EIO; // TODO: better error code
+        rc = -EIO;
     }
 
     return rc;
 }
 
-static int coroutine_mixed_fn __nvme_tcp_await_datav(NvmeTcpQueue *queue, struct iovec *iov, size_t niov, size_t len, uint16_t cid, Error **errp)
+static int __nvme_tcp_await_datav(NvmeTcpQueue *queue, struct iovec *iov, size_t niov, size_t len, uint16_t cid, Error **errp)
 {
     ERRP_GUARD();
     int rc;
@@ -504,7 +532,7 @@ static int coroutine_mixed_fn __nvme_tcp_await_datav(NvmeTcpQueue *queue, struct
         return -EIO;
     }
 
-    rc = qio_channel_readv_all(QIO_CHANNEL(queue->sock), iov, niov, errp);
+    rc = qio_channel_readv_all(QIO_CHANNEL(queue->sioc), iov, niov, errp);
     if (rc) {
         error_prepend(errp, "Failed to recv data: ");
         return rc;
@@ -521,6 +549,9 @@ static inline int nvme_tcp_await_data(NvmeTcpQueue *queue, void *buf, size_t len
     return __nvme_tcp_await_datav(queue, &iov, 1, len, cid, errp);
 }
 
+/**
+ * Helper function for setup commands where blocking is desired
+ */
 static int nvme_tcp_submit_command_and_await_data(NvmeTcpQueue *q, NvmeCmd *cmd, void *recvbuf, size_t recvlen, Error **errp)
 {
     ERRP_GUARD();
@@ -540,59 +571,61 @@ static int nvme_tcp_submit_command_and_await_data(NvmeTcpQueue *q, NvmeCmd *cmd,
     return 0;
 }
 
-static int nvme_tcp_queue_connect(BDRVNVMeTCPState *s, NvmeTcpQueue *queue, uint16_t cntlid, Error **errp)
+/**
+ * Call this after nvme_tcp_transport_connect() to fully establish a queue pair
+ * Pass @cntlid 0xffff for establishing the admin queue.
+ * Sets @s->cntlid on setup of the admin queue.
+ */
+static int nvme_tcp_queue_connect(BDRVNVMeTCPState *s, NvmeTcpQueue *q, uint16_t cntlid, Error **errp)
 {
     ERRP_GUARD();
-    assert(queue->sock);
-
-    NvmfConnectCommand cmd = {0};
-    NvmfConnectData data = {0};
-    int rc;
-
-    cmd.opcode = NVME_ADM_CMD_FABRICS;
-    /*
-     * Why 0x40? The standard says reserved. Well, I can't tell you either,
-     * but when I wireshark the kernel driver this flag is set.
-     */
-    cmd.resv1 = 0x40; // 0x80 for SGL flag??
-    cmd.fctype = NVME_FCTYPE_CONNECT;
     NvmeSglDescriptor sgl = {
         .type = NVME_TCP_SGL_TYPE_DATA_BLOCK,
         .len = cpu_to_le32(1024),
     };
-    cmd.dptr.sgl = sgl;
-    cmd.qid = cpu_to_le16(queue->qid);
-    cmd.sqsize = cpu_to_le16(31);
-    cmd.recfmt = 0;
-    // TODO FIXME somehow the connect response still gives an SQHD
-    // we might have to adhere to flow control anyway...
-    cmd.cattr = 0x00; // 0x04 to disable flow control (DISSQFC), else 0x00
-    cmd.kato = cpu_to_le32(NVME_TCP_KATO);
+    NvmfConnectCommand cmd = {
+        .opcode = NVME_ADM_CMD_FABRICS,
+        .flags = 0x40,
+        .fctype = NVME_FCTYPE_CONNECT,
+        .dptr.sgl = sgl,
+        .qid = cpu_to_le16(q->qid),
+        .sqsize = cpu_to_le16(31), // TODO what is this
+        .recfmt = 0, // TODO what is this
+        .cattr = 0x00, // TODO what is this
+        .kato = cpu_to_le32(NVME_TCP_KATO),
+    };
+    NvmfConnectData data = {
+        .hostid = s->hostid, // TODO: may not convey the right uuid bc of endianness
+        .cntlid = cpu_to_le16(cntlid),
+    };
+    NvmfCompletion completion;
+    int rc;
 
-    data.hostid = s->hostid; // TODO: may not convey the right uuid bc of endianness
-    data.cntlid = cntlid;
+    assert(q->sioc);
 
     pstrcpy(data.subsysnqn, 256, s->subsysnqn);
     snprintf(data.hostnqn, 256, "nqn.2014-08.org.nvmexpress:uuid:");
     qemu_uuid_unparse(&s->hostid, data.hostnqn + strlen("nqn.2014-08.org.nvmexpress:uuid:"));
 
-    NvmfCompletion completion = {};
-    rc = nvme_tcp_submit_command_and_await_completion(queue, (NvmeCmd *) &cmd, &data, sizeof(NvmfConnectData), true, &completion, errp);
-    if (rc != 0) {
-        error_prepend(errp, "Could not create queue %d! ", queue->qid);
+    rc = nvme_tcp_submit_command_and_await_completion(q, (NvmeCmd *) &cmd, &data, sizeof(NvmfConnectData), &completion, errp);
+    if (rc) {
+        error_prepend(errp, "Could not create queue %d! ", q->qid);
         return rc;
     }
     /* save cntlid on first connect (admin queue) */
-    if (cntlid == 0xffff && queue->qid == 0) {
+    if (cntlid == 0xffff && q->qid == 0) {
         s->cntlid = le16_to_cpu(completion.result.u16);
     }
 
-    trace_nvmf_tcp_queue_created(queue->qid);
+    trace_nvmf_tcp_queue_created(q->qid);
 
     return rc;
 }
 
-static int nvme_tcp_property_get32(NvmeTcpQueue *queue, uint32_t offset, uint32_t *result, Error **errp)
+/**
+ * Get uint32_t property from controller
+ */
+static int nvme_tcp_property_get32(NvmeTcpQueue *q, uint32_t offset, uint32_t *result, Error **errp)
 {
     NvmfPropertyGetCmd cmd = {
         .opcode = NVME_ADM_CMD_FABRICS,
@@ -603,13 +636,16 @@ static int nvme_tcp_property_get32(NvmeTcpQueue *queue, uint32_t offset, uint32_
     };
     NvmfCompletion completion;
 
-    int rc = nvme_tcp_submit_command_and_await_completion(queue, (NvmeCmd *) &cmd, NULL, 0, true, &completion, errp);
+    int rc = nvme_tcp_submit_command_and_await_completion(q, (NvmeCmd *) &cmd, NULL, 0, &completion, errp);
     *result = le32_to_cpu(completion.result.u32);
 
     return rc;
 }
 
-static int nvme_tcp_property_get64(NvmeTcpQueue *queue, uint32_t offset, uint64_t *result, Error **errp)
+/**
+ * Get uint64_t property from controller
+ */
+static int nvme_tcp_property_get64(NvmeTcpQueue *q, uint32_t offset, uint64_t *result, Error **errp)
 {
     NvmfPropertyGetCmd cmd = {
         .opcode = NVME_ADM_CMD_FABRICS,
@@ -620,13 +656,16 @@ static int nvme_tcp_property_get64(NvmeTcpQueue *queue, uint32_t offset, uint64_
     };
     NvmfCompletion completion;
 
-    int rc = nvme_tcp_submit_command_and_await_completion(queue, (NvmeCmd *) &cmd, NULL, 0, true, &completion, errp);
+    int rc = nvme_tcp_submit_command_and_await_completion(q, (NvmeCmd *) &cmd, NULL, 0, &completion, errp);
     *result = le64_to_cpu(completion.result.u64);
 
     return rc;
 }
 
-static int nvme_tcp_property_set32(NvmeTcpQueue *queue, uint32_t offset, uint32_t value, Error **errp)
+/**
+ * Set uint32_t property on controller
+ */
+static int nvme_tcp_property_set32(NvmeTcpQueue *q, uint32_t offset, uint32_t value, Error **errp)
 {
     NvmfPropertySetCmd cmd = {
         .opcode = NVME_ADM_CMD_FABRICS,
@@ -638,45 +677,36 @@ static int nvme_tcp_property_set32(NvmeTcpQueue *queue, uint32_t offset, uint32_
     };
     NvmfCompletion completion;
 
-    return nvme_tcp_submit_command_and_await_completion(queue, (NvmeCmd *) &cmd, NULL, 0, true, &completion, errp);
+    return nvme_tcp_submit_command_and_await_completion(q, (NvmeCmd *) &cmd, NULL, 0, &completion, errp);
 }
 
-// static int nvme_tcp_property_set64(NvmfTcpQueue *queue, uint32_t offset, uint64_t value, Error **errp)
-// {
-//     NvmfPropertySetCmd cmd = {
-//         .opcode = NVME_ADM_CMD_FABRICS,
-//         .resv1 = 0x00,
-//         .cid = cpu_to_le16(queue->next_cid++),
-//         .fctype = NVME_FCTYPE_PROPERTY_SET,
-//         .attrib = 0x01, /* 8 bytes value */
-//         .offset = cpu_to_le32(offset),
-//         .value = cpu_to_le64(value),
-//     };
-//     NvmfCompletion completion = {0};
-
-//     return nvmf_tcp_submit_command_and_await_completion(queue, (NvmeCmd *) &cmd, NULL, 0, &completion, errp);
-// }
-
+/**
+ * Callback for keep alive timer
+ */
 static void nvme_tcp_ka_cb(void *opaque)
 {
     BDRVNVMeTCPState *s = opaque;
     Error *err = NULL;
-    int rc;
-
     NvmeCmd cmd = {
         .opcode = 0x18,
     };
     NvmfCompletion cqe;
+    int rc;
 
     // theoretically, we should lock this, tho the admin queue isn't used for anything other than setup in the current state
     // and we'd need a different lock type
-    rc = nvme_tcp_submit_command_and_await_completion(s->admin_queue, &cmd, NULL, 0, true, &cqe, &err);
+    rc = nvme_tcp_submit_command_and_await_completion(s->admin_queue, &cmd, NULL, 0, &cqe, &err);
     if (rc) {
         error_propagate_prepend(&error_abort, err, "Keep-alive cmd failed: ");
     }
     timer_mod(s->ka_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + NVME_TCP_KATO/2);
 }
 
+/**
+ * Setup phase executed in nvme_tcp_open()
+ * Gets certain properties from controller to initialize @s
+ * and configures controller
+ */
 static int nvme_tcp_setup_configuration(BDRVNVMeTCPState *s, Error **errp)
 {
     uint64_t cap;
@@ -748,6 +778,10 @@ static int nvme_tcp_setup_configuration(BDRVNVMeTCPState *s, Error **errp)
     return 0;
 }
 
+/**
+ * Setup phase executed in nvme_tcp_open()
+ * Gets certain properties from controller to initialize @s
+ */
 static int nvme_tcp_setup_identify(BDRVNVMeTCPState *s, Error **errp)
 {
     ERRP_GUARD();
@@ -850,17 +884,86 @@ static int nvme_tcp_setup_identify(BDRVNVMeTCPState *s, Error **errp)
 }
 
 /**
- * Exclusively exists to increase legibility of nvme_tcp_open()
+ * Setup phase executed in nvme_tcp_open()
+ * Allocates io queues with the controller, initializes them in @s
+ * and performs protocol handshakes to set them up
+ */
+static int nvme_tcp_setup_create_ioqueues(BDRVNVMeTCPState *s, Error **errp)
+{
+    ERRP_GUARD();
+    NvmeCmd cmd = {
+        .opcode = NVME_ADM_CMD_SET_FEATURES,
+        .cdw10 = cpu_to_le32(0x7),
+        .cdw11 = (cpu_to_le16(s->num_io_threads) << 16) /* 0-based + main iothread*/
+               | (cpu_to_le16(s->num_io_threads) & 0xffff), // TODO
+    };
+    NvmfCompletion completion;
+    unsigned num_io_queues_allocated;
+    int rc;
+
+    rc = nvme_tcp_submit_command_and_await_completion(s->admin_queue, &cmd, NULL, 0, &completion, errp);
+    if (rc) {
+        error_prepend(errp, "Failed to allocate io queues with controller: ");
+        return rc;
+    }
+
+    num_io_queues_allocated = le16_to_cpu(completion.result.u32 & 0xffff);
+    if (s->num_io_threads + 1 > num_io_queues_allocated) {
+        error_setg(errp, "Controller only allows %u IO-Queues", num_io_queues_allocated);
+        error_append_hint(errp, "%u IO-Queues were requested: %u IOThreads + 1 main IO-thread", s->num_io_threads + 1, s->num_io_threads);
+        return -EINVAL;
+    }
+    s->max_num_io_queues = s->num_io_threads + 1;
+
+    s->io_queues = g_new0(NvmeTcpQueue *, s->max_num_io_queues);
+    for (size_t i = 0; i < s->max_num_io_queues; i++) {
+        s->io_queues[i] = g_new0(NvmeTcpQueue, 1);
+        s->io_queues[i]->sqsize = s->sqsize;
+        s->io_queues[i]->next_cid = 0;
+        rc = nvme_tcp_queue_transport_connect(s, s->io_queues[i], i + 1, errp);
+        if (rc) {
+            return rc;
+        }
+        rc = nvme_tcp_queue_connect(s, s->io_queues[i], s->cntlid, errp);
+        if (rc) {
+            return rc;
+        }
+        qemu_co_mutex_init(&s->io_queues[i]->wlock);
+        qemu_co_mutex_init(&s->io_queues[i]->rlock);
+    }
+
+    return 0;
+}
+
+static int nvme_tcp_enable_disable_write_cache(BDRVNVMeTCPState *s,
+    bool enable, Error **errp)
+{
+    ERRP_GUARD();
+    NvmeCmd cmd = {
+        .opcode = NVME_ADM_CMD_SET_FEATURES,
+        .cdw10 = cpu_to_le32(0x6),
+        .cdw11 = cpu_to_le32(enable ? 0x1 : 0x0),
+    };
+    NvmfCompletion completion;
+    int rc;
+
+    rc = nvme_tcp_submit_command_and_await_completion(s->admin_queue, &cmd, NULL, 0, &completion, errp);
+    if (rc) {
+        error_prepend(errp, "Failed to %sable write cache: ", enable ? "en" : "dis");
+        return rc;
+    }
+
+    return 0;
+}
+
+/**
+ * Exists to increase legibility of nvme_tcp_open()
  */
 static int __nvme_tcp_open(BlockDriverState *bs, Error **errp)
 {
     ERRP_GUARD();
     BDRVNVMeTCPState *s = bs->opaque;
     int rc;
-
-    QemuUUID hostid;
-    qemu_uuid_generate(&hostid);
-    s->hostid = hostid;
 
     /* for admin queues, cntlid and qid are fixed at 0xffff and 0 */
     s->admin_queue = g_new0(NvmeTcpQueue, 1);
@@ -890,44 +993,10 @@ static int __nvme_tcp_open(BlockDriverState *bs, Error **errp)
         return rc;
     }
 
-    NvmeSglDescriptor set_features_sgl = {
-        .type = NVME_TCP_SGL_TYPE_DATA_BUFFER,
-    };
-    NvmeCmd request_num_io_queues = {
-        .opcode = NVME_ADM_CMD_SET_FEATURES,
-        .dptr.sgl = set_features_sgl,
-        .cdw10 = cpu_to_le32(0x7),
-        .cdw11 = (cpu_to_le16(s->num_io_threads) << 16) /* 0-based + main iothread*/
-               | (cpu_to_le16(s->num_io_threads) & 0xffff), // TODO
-    };
-    NvmfCompletion completion_num_io_queues;
-    rc = nvme_tcp_submit_command_and_await_completion(s->admin_queue, &request_num_io_queues, NULL, 0, true, &completion_num_io_queues, errp);
+    rc = nvme_tcp_setup_create_ioqueues(s, errp);
     if (rc) {
+        error_prepend(errp, "Failed to create io queues: ");
         return rc;
-    }
-    unsigned num_io_queues_allocated = le16_to_cpu(completion_num_io_queues.result.u32 & 0xffff);
-    if (s->num_io_threads + 1 > num_io_queues_allocated) {
-        error_setg(errp, "Target only allows %u IO-Queues", num_io_queues_allocated);
-        error_append_hint(errp, "%u IO-Queues were requested: %u IOThreads + 1 main IO-thread", s->num_io_threads + 1, s->num_io_threads);
-        return -EINVAL;
-    }
-    s->max_num_io_queues = s->num_io_threads + 1;
-
-    s->io_queues = g_malloc(sizeof(NvmeTcpQueue *) * s->max_num_io_queues);
-    for (size_t i = 0; i < s->max_num_io_queues; i++) {
-        s->io_queues[i] = g_new0(NvmeTcpQueue, 1);
-        s->io_queues[i]->sqsize = le16_to_cpu(s->sqsize);
-        s->io_queues[i]->next_cid = 0;
-        rc = nvme_tcp_queue_transport_connect(s, s->io_queues[i], i + 1, errp);
-        if (rc != 0) {
-            return rc;
-        }
-        rc = nvme_tcp_queue_connect(s, s->io_queues[i], s->cntlid, errp);
-        if (rc != 0) {
-            return rc;
-        }
-        qemu_co_mutex_init(&s->io_queues[i]->wlock);
-        qemu_co_mutex_init(&s->io_queues[i]->rlock);
     }
 
     trace_nvmf_tcp_setup_complete(s->page_size, 1U << s->blkshift);
@@ -935,14 +1004,46 @@ static int __nvme_tcp_open(BlockDriverState *bs, Error **errp)
     return 0;
 }
 
+/**
+ * Part of BlockDriver definition.
+ */
 static void nvme_tcp_close(BlockDriverState *bs)
 {
-    // TODO: free queues or something
     BDRVNVMeTCPState *s = bs->opaque;
+    Error *err = NULL;
+    int rc;
+
     g_free(s->subsysnqn);
-    timer_free(s->ka_timer);
+
+    if (s->admin_queue) {
+        rc = qio_channel_shutdown(QIO_CHANNEL(s->admin_queue->sioc), QIO_CHANNEL_SHUTDOWN_BOTH, &err);
+        if (rc) {
+            error_propagate_prepend(&error_abort, err, "Failed to shutdown TCP connection: ");
+            err = NULL;
+        }
+        g_free(s->admin_queue);
+    }
+
+    if (s->ka_timer) {
+        timer_free(s->ka_timer);
+    }
+
+    if (s->io_queues) {
+        for (unsigned i = 0; i < s->max_num_io_queues; i++) {
+            rc = qio_channel_shutdown(QIO_CHANNEL(s->io_queues[i]->sioc), QIO_CHANNEL_SHUTDOWN_BOTH, &err);
+            if (rc) {
+                error_propagate_prepend(&error_abort, err, "Failed to shutdown TCP connection: ");
+                err = NULL;
+            }
+            g_free(s->io_queues[i]);
+        }
+        g_free(s->io_queues);
+    }
 }
 
+/**
+ * Parse cli options for nvme_tcp_open()
+ */
 static BlockdevOptionsNvmeTcp *nvme_tcp_parse_options(QDict *options, Error **errp)
 {
     BlockdevOptionsNvmeTcp *result;
@@ -971,17 +1072,19 @@ static BlockdevOptionsNvmeTcp *nvme_tcp_parse_options(QDict *options, Error **er
 }
 
 /**
- * TODO: go over this completely, c/p from nvme.c
+ * Part of BlockDriver definition.
  */
 static int nvme_tcp_open(BlockDriverState *bs, QDict *options, int flags,
-                     Error **errp)
+    Error **errp)
 {
+    ERRP_GUARD();
     BDRVNVMeTCPState *s = bs->opaque;
+    BlockdevOptionsNvmeTcp *opts;
+    int rc;
+
     qemu_mutex_init(&s->thread_ioq_mapping_wlock);
 
-    bs->supported_write_flags = BDRV_REQ_FUA;
-
-    BlockdevOptionsNvmeTcp *opts = nvme_tcp_parse_options(options, errp);
+    opts = nvme_tcp_parse_options(options, errp);
     if (!opts) {
         return -EINVAL;
     }
@@ -990,32 +1093,45 @@ static int nvme_tcp_open(BlockDriverState *bs, QDict *options, int flags,
     s->subsysnqn = g_strdup(opts->subsysnqn);
     s->nsid = opts->has_nsid ? opts->nsid : 1;
     s->num_io_threads = opts->has_num_io_threads ? opts->num_io_threads : 0;
+
+    /* in case setup succeeds only partially, see nvme_tcp_close() */
+    s->admin_queue = NULL;
+    s->ka_timer = NULL;
+    s->io_queues = NULL;
+
+    qemu_uuid_generate(&s->hostid);
     s->next_unused_io_q = 0;
 
-    int ret = __nvme_tcp_open(bs, errp);
-
-    if (ret) {
+    rc = __nvme_tcp_open(bs, errp);
+    if (rc) {
+        error_prepend(errp, "Failed to connect to NVMe drive: ");
         goto fail;
     }
+
     if (flags & BDRV_O_NOCACHE) {
-        // if (!s->write_cache_supported) {
+        if (!s->write_cache_supported) {
             error_setg(errp,
                        "NVMe controller doesn't support write cache configuration");
-            ret = -EINVAL;
-        // } else {
-        //     ret = nvmf_enable_disable_write_cache(bs, !(flags & BDRV_O_NOCACHE),
-        //                                           errp);
-        // }
-        // if (ret) {
+            rc = -EINVAL;
+        } else {
+            rc = nvme_tcp_enable_disable_write_cache(s, !(flags & BDRV_O_NOCACHE),
+                                                     errp);
+        }
+        if (rc) {
             goto fail;
-        // }
+        }
     }
+
     return 0;
+
 fail:
     nvme_tcp_close(bs);
-    return ret;
+    return rc;
 }
 
+/**
+ * Helper function used in nvme_tcp_get_io_queue_for_current_thread()
+ */
 static coroutine_fn NvmeTcpQueue *nvme_tcp_thread_ioq_mapping_get(BDRVNVMeTCPState *s)
 {
     for (unsigned i = 0; i < s->next_unused_io_q; i++) {
@@ -1027,6 +1143,11 @@ static coroutine_fn NvmeTcpQueue *nvme_tcp_thread_ioq_mapping_get(BDRVNVMeTCPSta
     return NULL;
 }
 
+/**
+ * Call this from i/o coroutines to get NvmeTcpQueue
+ * If thread has not yet been encountered previously, adds it to mapping,
+ * so no previous registration is necessary.
+ */
 static coroutine_fn NvmeTcpQueue *nvme_tcp_get_io_queue_for_current_thread(BDRVNVMeTCPState *s)
 {
     NvmeTcpQueue *q;
@@ -1054,14 +1175,24 @@ static coroutine_fn NvmeTcpQueue *nvme_tcp_get_io_queue_for_current_thread(BDRVN
     return q;
 }
 
-static NvmeTcpResponseCtx coroutine_fn *nvme_tcp_rctxrbuf_get(NvmeTcpQueue *q, uint16_t cid)
+/**
+ * Get previously registered response context from the ring buffer.
+ * Call from i/o coroutine to help appropriately handle a CQE for a given cid
+ */
+static coroutine_fn NvmeTcpResponseCtx *nvme_tcp_rctxrbuf_get(NvmeTcpQueue *q, uint16_t cid)
 {
     uint16_t cid_off = cid - q->rctxrbuf_tail_cid; /* accurately handle cid wrap-around */
     NvmeTcpResponseCtx *entry = &q->rctxrbuf[(q->rctxrbuf_tail_idx + cid_off) % RCTXRBUF_SIZE];
     return entry;
 }
 
-static void coroutine_fn nvme_tcp_rctxrbuf_register(NvmeTcpQueue *q, uint16_t cid, NvmeTcpReadInfo *readinfo, NvmeTcpR2tInfo *r2tinfo, uint8_t expected_type)
+/**
+ * Register response context in ring buffer.
+ * Call from i/o coroutine directly after submitting first entry
+ * associated with @cid
+ * Registered response contexts need to be deregistered later.
+ */
+static coroutine_fn void nvme_tcp_rctxrbuf_register(NvmeTcpQueue *q, uint16_t cid, NvmeTcpReadInfo *readinfo, NvmeTcpR2tInfo *r2tinfo, uint8_t expected_type)
 {
     NvmeTcpResponseCtx *rctx = nvme_tcp_rctxrbuf_get(q, cid);
     rctx->exists = true;
@@ -1080,7 +1211,12 @@ static void coroutine_fn nvme_tcp_rctxrbuf_register(NvmeTcpQueue *q, uint16_t ci
     rctx->expected_type = expected_type;
 }
 
-static void coroutine_fn nvme_tcp_rctxrbuf_refresh(NvmeTcpQueue *q, uint16_t cid, uint8_t expected_type)
+/**
+ * Refresh response context for handling additional CQEs.
+ * Call this from i/o coroutine after submitting a further entry
+ * associated with @cid
+ */
+static coroutine_fn void nvme_tcp_rctxrbuf_refresh(NvmeTcpQueue *q, uint16_t cid, uint8_t expected_type)
 {
     NvmeTcpResponseCtx *rctx = nvme_tcp_rctxrbuf_get(q, cid);
     assert(rctx->exists);
@@ -1089,7 +1225,12 @@ static void coroutine_fn nvme_tcp_rctxrbuf_refresh(NvmeTcpQueue *q, uint16_t cid
     rctx->expected_type = expected_type;
 }
 
-static void coroutine_fn nvme_tcp_rctxrbuf_deregister(NvmeTcpQueue *q, uint16_t cid)
+/**
+ * Deregister response context.
+ * Call this from i/o coroutine after having handled the last CQE
+ * associated with @cid
+ */
+static coroutine_fn void nvme_tcp_rctxrbuf_deregister(NvmeTcpQueue *q, uint16_t cid)
 {
     NvmeTcpResponseCtx *rctx = nvme_tcp_rctxrbuf_get(q, cid);
     assert(rctx->exists);
@@ -1100,7 +1241,14 @@ static void coroutine_fn nvme_tcp_rctxrbuf_deregister(NvmeTcpQueue *q, uint16_t 
     }
 }
 
-static int coroutine_fn nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_cid, Error **errp)
+/**
+ * Receive and handle CQE associated with @our_cid
+ * @our_cid needs to have a response context registered in the
+ * ring buffer of @q before calling this
+ * Automatically handles @q->rlock, reordering of CQEs, and coroutine yield
+ * Writes relevant return information in associated response context
+ */
+static coroutine_fn int nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_cid, Error **errp)
 {
     ERRP_GUARD();
     NvmfCompletion cqe;
@@ -1162,7 +1310,7 @@ static int coroutine_fn nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_
 
                 qemu_iovec_init_slice(&slice, their_rctx->u.readinfo->qiov, le32_to_cpu(pdu.data.datao), le32_to_cpu(pdu.data.datal));
 
-                rc = qio_channel_readv_all(QIO_CHANNEL(q->sock), slice.iov, slice.niov, errp);
+                rc = qio_channel_readv_all(QIO_CHANNEL(q->sioc), slice.iov, slice.niov, errp);
                 if (rc) {
                     error_prepend(errp, "Failed to recv data: ");
                     return rc;
@@ -1220,7 +1368,10 @@ static int coroutine_fn nvme_tcp_co_await_io_resp(NvmeTcpQueue *q, uint16_t our_
     return 0;
 }
 
-static int coroutine_fn nvme_tcp_co_submit_rwcmd(uint8_t opcode, BDRVNVMeTCPState *s,
+/**
+ * Helper function to create and send SQEs for various i/o commands
+ */
+static coroutine_fn int nvme_tcp_co_submit_rwcmd(uint8_t opcode, BDRVNVMeTCPState *s,
     NvmeTcpQueue *q, int64_t offset, int64_t bytes, QEMUIOVector *qiov,
     uint16_t *cid, Error **errp)
 {
@@ -1261,7 +1412,10 @@ static int coroutine_fn nvme_tcp_co_submit_rwcmd(uint8_t opcode, BDRVNVMeTCPStat
     return 0;
 }
 
-static int coroutine_fn nvme_tcp_co_preadv(BlockDriverState *bs,
+/**
+ * Part of BlockDriver definition.
+ */
+static coroutine_fn int nvme_tcp_co_preadv(BlockDriverState *bs,
     int64_t offset, int64_t bytes, QEMUIOVector *qiov,
     BdrvRequestFlags flags)
 {
@@ -1302,7 +1456,10 @@ static int coroutine_fn nvme_tcp_co_preadv(BlockDriverState *bs,
     return 0;
 }
 
-static int coroutine_fn nvme_tcp_co_pwritev(
+/**
+ * Part of BlockDriver definition.
+ */
+static coroutine_fn int nvme_tcp_co_pwritev(
     BlockDriverState *bs, int64_t offset, int64_t bytes, QEMUIOVector *qiov,
     BdrvRequestFlags flags)
 {
@@ -1333,8 +1490,8 @@ static int coroutine_fn nvme_tcp_co_pwritev(
         NvmeTcpDataPdu data_pdu = {
             .hdr = {
                 .type = NVME_TCP_PDUTYPE_H2CDATA,
-                .hlen = 24,
-                .pdo = 24,
+                .hlen = NVME_TCP_HLEN_H2CDATA,
+                .pdo = NVME_TCP_HLEN_H2CDATA,
             },
             .cid = cpu_to_le16(cid),
             .ttag = cpu_to_le16(r2tinfo.ttag),
@@ -1361,9 +1518,7 @@ static int coroutine_fn nvme_tcp_co_pwritev(
                 nvme_tcp_rctxrbuf_refresh(q, cid,
                     last ? NVME_TCP_PDUTYPE_CAPSULE_RESP : NVME_TCP_PDUTYPE_R2T);
 
-                qemu_co_mutex_lock(&q->wlock);
-                rc = qio_channel_writev_all(QIO_CHANNEL(q->sock), h2cdatavec.iov, h2cdatavec.niov, &err);
-                qemu_co_mutex_unlock(&q->wlock);
+                rc = nvme_tcp_sendv(q, h2cdatavec.iov, h2cdatavec.niov, &err);
                 if (rc) {
                     error_propagate_prepend(&error_abort, err, "Failed to send h2cdata: ");
                     return rc;
@@ -1386,6 +1541,9 @@ static int coroutine_fn nvme_tcp_co_pwritev(
     return 0;
 }
 
+/**
+ * Part of BlockDriver definition.
+ */
 static coroutine_fn int nvme_tcp_co_pwrite_zeroes(BlockDriverState *bs,
     int64_t offset, int64_t bytes, BdrvRequestFlags flags)
 {
@@ -1419,6 +1577,9 @@ static coroutine_fn int nvme_tcp_co_pwrite_zeroes(BlockDriverState *bs,
     return 0;
 }
 
+/**
+ * Part of BlockDriver definition.
+ */
 static coroutine_fn int nvme_tcp_co_pdiscard(BlockDriverState *bs,
     int64_t offset, int64_t bytes)
 {
@@ -1486,6 +1647,9 @@ static coroutine_fn int nvme_tcp_co_pdiscard(BlockDriverState *bs,
     return 0;
 }
 
+/**
+ * Helper function for nvme_tcp_co_flush()
+ */
 static coroutine_fn int __nvme_tcp_co_flush(BDRVNVMeTCPState *s, NvmeTcpQueue *q, BlockDriverState *bs, Error **errp)
 {
     ERRP_GUARD();
@@ -1504,7 +1668,7 @@ static coroutine_fn int __nvme_tcp_co_flush(BDRVNVMeTCPState *s, NvmeTcpQueue *q
             continue;
         }
 
-        rc = qio_channel_flush(QIO_CHANNEL(s->io_queues[i]->sock), &err);
+        rc = qio_channel_flush(QIO_CHANNEL(s->io_queues[i]->sioc), &err);
         if (rc) {
             error_prepend(errp, "Socket flush error: ");
             return rc;
@@ -1529,6 +1693,9 @@ static coroutine_fn int __nvme_tcp_co_flush(BDRVNVMeTCPState *s, NvmeTcpQueue *q
     return 0;
 }
 
+/**
+ * Part of BlockDriver definition.
+ */
 static coroutine_fn int nvme_tcp_co_flush(BlockDriverState *bs)
 {
     BDRVNVMeTCPState *s = bs->opaque;
@@ -1544,7 +1711,10 @@ static coroutine_fn int nvme_tcp_co_flush(BlockDriverState *bs)
     return rc;
 }
 
-static void nvmf_refresh_filename(BlockDriverState *bs)
+/**
+ * Part of BlockDriver definition.
+ */
+static void nvme_tcp_refresh_filename(BlockDriverState *bs)
 {
     BDRVNVMeTCPState *s = bs->opaque;
 
@@ -1552,6 +1722,11 @@ static void nvmf_refresh_filename(BlockDriverState *bs)
              s->tgtsock.u.inet.host, s->tgtsock.u.inet.port, s->subsysnqn);
 }
 
+/**
+ * Part of BlockDriver definition
+
+ * Assumes that s->page_size >= (1U << s->blkshift)
+ */
 static void nvme_tcp_refresh_limits(BlockDriverState *bs, Error **errp)
 {
     BDRVNVMeTCPState *s = bs->opaque;
@@ -1564,10 +1739,13 @@ static void nvme_tcp_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.pwrite_zeroes_alignment = s->page_size;
 
     bs->bl.max_pdiscard = MIN(s->dmrl * s->dmrsl, s->dmsl);
-    bs->bl.pdiscard_alignment = 0; /* use request_alignment */
+    bs->bl.pdiscard_alignment = bs->bl.request_alignment;
 }
 
-static int64_t coroutine_fn nvme_tcp_co_getlength(BlockDriverState *bs)
+/**
+ * Part of BlockDriver definition.
+ */
+static coroutine_fn int64_t nvme_tcp_co_getlength(BlockDriverState *bs)
 {
     BDRVNVMeTCPState *s = bs->opaque;
     return s->nsze << s->blkshift;
@@ -1576,11 +1754,10 @@ static int64_t coroutine_fn nvme_tcp_co_getlength(BlockDriverState *bs)
 /**
  * Part of BlockDriver definition
  *
- * This includes a workaround for discard granularity errors
- * and other potential incompatibilities:
- * QEMU is told that blocks are 512 byte, while request alignment
- * is at least 4096 byte anyway. We convert internally,
- * see nvme_tcp_blk_conv_shift()
+ * QEMU won't let me set a different logical block size from 512 byte,
+ * and SunBIOS doesn't like bigger block sizes either, so this is what we do.
+ * Request alignment is at least 4096 byte anyway (NVMe page size).
+ * Internally, we only use the "physical" block size.
  */
 static int nvme_tcp_probe_blocksizes(BlockDriverState *bs, BlockSizes *bsz)
 {
@@ -1593,10 +1770,9 @@ static int nvme_tcp_probe_blocksizes(BlockDriverState *bs, BlockSizes *bsz)
 }
 
 /**
- * nvme_tcp_reopen_prepare
+ * Part of BlockDriver definition.
  *
- * Mandatory part of block driver definition.
- * Does nothing
+ * Does nothing, but is mandatory.
  */
 static int nvme_tcp_reopen_prepare(BDRVReopenState *reopen_state,
     BlockReopenQueue *queue, Error **errp)
@@ -1604,10 +1780,13 @@ static int nvme_tcp_reopen_prepare(BDRVReopenState *reopen_state,
     return 0;
 }
 
-
-static int coroutine_fn nvme_tcp_co_truncate(BlockDriverState *bs, int64_t offset,
-                                         bool exact, PreallocMode prealloc,
-                                         BdrvRequestFlags flags, Error **errp)
+/**
+ * Part of BlockDriver definition.
+ *
+ * Does nothing. (But does return success on non-exact shrinking)
+ */
+static coroutine_fn int nvme_tcp_co_truncate(BlockDriverState *bs, int64_t offset,
+    bool exact, PreallocMode prealloc, BdrvRequestFlags flags, Error **errp)
 {
     int64_t cur_length;
 
@@ -1630,9 +1809,9 @@ static int coroutine_fn nvme_tcp_co_truncate(BlockDriverState *bs, int64_t offse
 }
 
 /**
- * part of BlockDriver definition
+ * Part of BlockDriver definition.
  *
- * options that change drive data
+ * Options that change drive data.
  */
 static const char *const nvme_tcp_strong_runtime_opts[] = {
     NVME_TCP_BLOCK_OPT_IP,
@@ -1665,7 +1844,7 @@ static BlockDriver bdrv_nvme_tcp = {
 
     .bdrv_co_flush_to_disk    = nvme_tcp_co_flush,
 
-    .bdrv_refresh_filename    = nvmf_refresh_filename,
+    .bdrv_refresh_filename    = nvme_tcp_refresh_filename,
     .bdrv_refresh_limits      = nvme_tcp_refresh_limits,
     .strong_runtime_opts      = nvme_tcp_strong_runtime_opts,
 };

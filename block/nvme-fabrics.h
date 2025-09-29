@@ -1,13 +1,9 @@
 #ifndef NVME_FABRICS
 #define NVME_FABRICS
 
-// #include "qemu/osdep.h"
-// #include "block/nvme.h"
-// #include "qemu/uuid.h"
-
 typedef struct QEMU_PACKED NvmfConnectCommand {
     uint8_t     opcode;
-    uint8_t     resv1;
+    uint8_t     flags;
     uint16_t    cid;
     uint8_t     fctype;
     uint8_t     resv2[19];
@@ -80,7 +76,7 @@ typedef struct QEMU_PACKED NvmfCompletion {
     } result;
     uint16_t sq_head;    /* how much of this queue may be reclaimed */
     uint16_t sq_id;      /* submission queue that generated this entry */
-    uint16_t cid; /* of the command which completed */
+    uint16_t cid;        /* of the command which completed */
     uint16_t status;     /* did the command fail, and if so, why? */
 } NvmfCompletion;
 
