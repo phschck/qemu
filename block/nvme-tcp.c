@@ -126,7 +126,8 @@ typedef struct NvmeTcpResponseCtx {
 
 struct NvmeTcpQueue {
     QIOChannelSocket *sioc;
-    QemuThread thread;
+    QemuThread thread;    /* write-protected by thread_ioq_mapping_wlock */
+    bool assigned_thread; /* write-protected by thread_ioq_mapping_wlock */
 
     CoMutex wlock;
     CoMutex rlock;
@@ -1135,7 +1136,9 @@ fail:
 static coroutine_fn NvmeTcpQueue *nvme_tcp_thread_ioq_mapping_get(BDRVNVMeTCPState *s)
 {
     for (unsigned i = 0; i < s->next_unused_io_q; i++) {
-        if (qemu_thread_is_self(&s->io_queues[i]->thread)) {
+        if (likely(s->io_queues[i]->assigned_thread) &&
+            qemu_thread_is_self(&s->io_queues[i]->thread)
+        ) {
             return s->io_queues[i];
         }
     }
@@ -1165,7 +1168,12 @@ static coroutine_fn NvmeTcpQueue *nvme_tcp_get_io_queue_for_current_thread(BDRVN
         qemu_mutex_lock(&s->thread_ioq_mapping_wlock);
         q = nvme_tcp_thread_ioq_mapping_get(s); /* check again after locking */
         if (!q) {
-            qemu_thread_get_self(&s->io_queues[s->next_unused_io_q++]->thread);
+            /* by setting assigned_thread to true after writing, we build
+             * a shitty (*cogh* er, i mean, performant) rw mutex for thread */
+            qemu_thread_get_self(&s->io_queues[s->next_unused_io_q]->thread);
+            s->io_queues[s->next_unused_io_q]->assigned_thread = true;
+            s->next_unused_io_q++;
+
             q = nvme_tcp_thread_ioq_mapping_get(s);
             assert(q);
         }
